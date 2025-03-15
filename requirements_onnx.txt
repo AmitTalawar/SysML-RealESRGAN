@@ -1,0 +1,10 @@
+basicsr>=1.4.2
+numpy
+opencv-python
+Pillow
+torch>=1.7
+torchvision
+tqdm
+onnx>=1.12.0
+onnxruntime>=1.13.1
+ffmpeg-python 
