@@ -72,7 +72,7 @@ class RealESRGANerONNX:
         # pre_pad
         if self.pre_pad != 0:
             self.img = np.pad(self.img, ((0, 0), (0, 0), (0, self.pre_pad), (0, self.pre_pad)), mode='reflect')
-        
+
         # mod pad for divisible borders
         if self.scale == 2:
             self.mod_scale = 2
@@ -322,6 +322,8 @@ class Writer:
             print('You are generating video that is larger than 4K, which will be very slow due to IO speed.',
                   'We highly recommend to decrease the outscale(aka, -s).')
 
+        print(f"Creating output video with dimensions: {out_width}x{out_height}, FPS: {fps}")
+
         if audio is not None:
             self.stream_writer = (
                 ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{out_width}x{out_height}',
@@ -342,18 +344,39 @@ class Writer:
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
 
     def write_frame(self, frame):
-        frame = frame.astype(np.uint8).tobytes()
-        self.stream_writer.stdin.write(frame)
+        # Ensure frame is valid
+        if frame is None or frame.size == 0:
+            print("Warning: Empty frame detected, skipping")
+            return
+
+        # Ensure frame is in the correct format (uint8)
+        if frame.dtype != np.uint8:
+            print(f"Warning: Converting frame from {frame.dtype} to uint8")
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        # Check if frame has any content
+        if np.max(frame) == 0:
+            print("Warning: Black frame detected")
+
+        try:
+            frame_bytes = frame.tobytes()
+            self.stream_writer.stdin.write(frame_bytes)
+        except Exception as e:
+            print(f"Error writing frame: {e}")
 
     def close(self):
-        self.stream_writer.stdin.close()
-        self.stream_writer.wait()
+        try:
+            self.stream_writer.stdin.close()
+            self.stream_writer.wait()
+            print("Video writer closed successfully")
+        except Exception as e:
+            print(f"Error closing video writer: {e}")
 
 
 def convert_to_onnx(model_name, model_path, onnx_path):
     """Convert PyTorch model to ONNX format."""
     print(f'Converting {model_name} to ONNX format...')
-    
+
     # Load model
     if model_name == 'RealESRGAN_x4plus':  # x4 RRDBNet model
         model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
@@ -375,10 +398,10 @@ def convert_to_onnx(model_name, model_path, onnx_path):
         netscale = 4
     else:
         raise ValueError(f'Unknown model name: {model_name}')
-    
+
     # Load model weights
     loadnet = torch.load(model_path, map_location=torch.device('cpu'))
-    
+
     # prefer to use params_ema
     if 'params_ema' in loadnet:
         keyname = 'params_ema'
@@ -386,10 +409,10 @@ def convert_to_onnx(model_name, model_path, onnx_path):
         keyname = 'params'
     model.load_state_dict(loadnet[keyname], strict=True)
     model.eval()
-    
+
     # Create dummy input
     dummy_input = torch.randn(1, 3, 64, 64)
-    
+
     # Export to ONNX
     torch.onnx.export(
         model,
@@ -403,11 +426,11 @@ def convert_to_onnx(model_name, model_path, onnx_path):
         dynamic_axes={'input': {0: 'batch_size', 2: 'height', 3: 'width'},
                       'output': {0: 'batch_size', 2: 'height', 3: 'width'}}
     )
-    
+
     # Verify ONNX model
     onnx_model = onnx.load(onnx_path)
     onnx.checker.check_model(onnx_model)
-    
+
     print(f'ONNX model saved to {onnx_path}')
     return onnx_path
 
@@ -433,7 +456,7 @@ def inference_video(args, video_save_path):
             elif model_name == 'realesr-general-x4v3':
                 url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth'
             model_path = load_file_from_url(url=url, model_dir=os.path.join(ROOT_DIR, 'weights'), progress=True, file_name=None)
-        
+
         # Convert to ONNX
         convert_to_onnx(model_name, model_path, args.onnx_model_path)
 
@@ -467,24 +490,67 @@ def inference_video(args, video_save_path):
     fps = reader.get_fps()
     writer = Writer(args, audio, height, width, video_save_path, fps)
 
+    # Create debug directory if needed
+    debug_dir = None
+    if args.debug:
+        debug_dir = os.path.join(args.output, 'debug_frames_cpu')
+        os.makedirs(debug_dir, exist_ok=True)
+        print(f"Debug frames will be saved to: {debug_dir}")
+
     pbar = tqdm(total=len(reader), unit='frame', desc='inference')
+    frame_count = 0
     while True:
         img = reader.get_frame()
         if img is None:
             break
 
+        # Debug: Print input frame info
+        if args.debug and frame_count == 0:
+            print(f"Input frame shape: {img.shape}, dtype: {img.dtype}, min: {np.min(img)}, max: {np.max(img)}")
+            input_debug_path = os.path.join(debug_dir, f"input_frame_{frame_count}.png")
+            cv2.imwrite(input_debug_path, img)
+            print(f"Saved input debug frame to: {input_debug_path}")
+
         try:
-            output, _ = upsampler.enhance(img, outscale=args.outscale)
+            output, img_mode = upsampler.enhance(img, outscale=args.outscale)
+
+            # Debug: Print output frame info
+            if args.debug:
+                print(f"Output frame shape: {output.shape}, dtype: {output.dtype}, min: {np.min(output)}, max: {np.max(output)}")
+                if frame_count % 10 == 0:  # Save every 10th frame to avoid too many files
+                    output_debug_path = os.path.join(debug_dir, f"output_frame_{frame_count}.png")
+                    cv2.imwrite(output_debug_path, output)
+                    print(f"Saved output debug frame to: {output_debug_path}")
+
+            # Ensure output is valid
+            if np.isnan(output).any() or np.max(output) == 0:
+                print(f"Warning: Frame {frame_count} has invalid values. Using original frame instead.")
+                # Resize original frame as fallback
+                output = cv2.resize(img, (int(width * args.outscale), int(height * args.outscale)),
+                                   interpolation=cv2.INTER_LANCZOS4)
+
+            writer.write_frame(output)
         except RuntimeError as error:
-            print('Error', error)
+            print(f'Error processing frame {frame_count}:', error)
             print('If you encounter memory issues, try to set --tile with a smaller number.')
-        else:
+            # Resize original frame as fallback
+            output = cv2.resize(img, (int(width * args.outscale), int(height * args.outscale)),
+                               interpolation=cv2.INTER_LANCZOS4)
+            writer.write_frame(output)
+        except Exception as e:
+            print(f'Unexpected error processing frame {frame_count}:', e)
+            # Resize original frame as fallback
+            output = cv2.resize(img, (int(width * args.outscale), int(height * args.outscale)),
+                               interpolation=cv2.INTER_LANCZOS4)
             writer.write_frame(output)
 
         pbar.update(1)
+        frame_count += 1
 
     reader.close()
     writer.close()
+    print(f"Video processing complete. Processed {frame_count} frames.")
+    print(f"Output saved to: {video_save_path}")
 
 
 def main():
@@ -513,6 +579,7 @@ def main():
     parser.add_argument('--pre_pad', type=int, default=0, help='Pre padding size at each border')
     parser.add_argument('--fps', type=float, default=None, help='FPS of the output video')
     parser.add_argument('--ffmpeg_bin', type=str, default='ffmpeg', help='The path to ffmpeg')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode to save intermediate frames')
     args = parser.parse_args()
 
     # Set default ONNX model path if not provided
@@ -529,4 +596,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main() 
+    main()
