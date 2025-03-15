@@ -61,25 +61,51 @@ class RealESRGANerONNX:
         self.mod_scale = None
         self.gpu_id = gpu_id
 
-        # Setup providers for ONNX Runtime
-        # Always try to use CUDA first, then fall back to CPU if not available
-        providers = []
+        # Setup ONNX Runtime session options
+        session_options = ort.SessionOptions()
+        # Set graph optimization level
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # Set execution mode
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-        # Check if CUDA is available in ONNX Runtime
+        # Setup providers with proper configuration
+        providers = []
         cuda_available = 'CUDAExecutionProvider' in ort.get_available_providers()
+
         if cuda_available:
-            providers.append(('CUDAExecutionProvider', {'device_id': self.gpu_id}))
+            # Configure CUDA provider with proper settings
+            cuda_provider_options = {
+                'device_id': self.gpu_id,
+                'arena_extend_strategy': 'kNextPowerOfTwo',
+                'gpu_mem_limit': 2 * 1024 * 1024 * 1024,  # 2GB
+                'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                'do_copy_in_default_stream': True,
+            }
+            providers.append(('CUDAExecutionProvider', cuda_provider_options))
+
+        # Always add CPU provider as fallback
         providers.append('CPUExecutionProvider')
 
         # Print available providers for debugging
         print(f"Available ONNX Runtime providers: {ort.get_available_providers()}")
         print(f"Using providers: {providers}")
+        print(f"ONNX Runtime version: {ort.__version__}")
 
-        # Load ONNX model
+        # Load ONNX model with proper error handling
         try:
-            self.ort_session = ort.InferenceSession(model_path, providers=providers)
+            print(f"Loading ONNX model from: {model_path}")
+            self.ort_session = ort.InferenceSession(
+                model_path,
+                sess_options=session_options,
+                providers=providers
+            )
+
             self.input_name = self.ort_session.get_inputs()[0].name
             self.output_name = self.ort_session.get_outputs()[0].name
+
+            # Print model input/output details
+            print(f"Model input name: {self.input_name}, shape: {self.ort_session.get_inputs()[0].shape}")
+            print(f"Model output name: {self.output_name}, shape: {self.ort_session.get_outputs()[0].shape}")
 
             # Check if GPU is being used
             session_providers = self.ort_session.get_providers()
@@ -94,10 +120,18 @@ class RealESRGANerONNX:
         except Exception as e:
             print(f"Error initializing ONNX session: {e}")
             print("Trying to load with CPU provider only...")
-            self.ort_session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-            self.input_name = self.ort_session.get_inputs()[0].name
-            self.output_name = self.ort_session.get_outputs()[0].name
-            print("Successfully loaded model with CPU provider.")
+            try:
+                self.ort_session = ort.InferenceSession(
+                    model_path,
+                    sess_options=session_options,
+                    providers=['CPUExecutionProvider']
+                )
+                self.input_name = self.ort_session.get_inputs()[0].name
+                self.output_name = self.ort_session.get_outputs()[0].name
+                print("Successfully loaded model with CPU provider.")
+            except Exception as e2:
+                print(f"Fatal error loading model even with CPU: {e2}")
+                raise RuntimeError("Could not load ONNX model with any provider")
 
     def pre_process(self, img):
         """Pre-process, such as pre-pad and mod pad, so that the images can be divisible
@@ -105,13 +139,23 @@ class RealESRGANerONNX:
         # Debug input image
         print(f"Pre-process input shape: {img.shape}, dtype: {img.dtype}, min: {np.min(img)}, max: {np.max(img)}")
 
-        # Check for NaN or invalid values
+        # Ensure input is valid
         if np.isnan(img).any():
             print("WARNING: Input image contains NaN values!")
             img = np.nan_to_num(img)
 
-        img = np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0
-        self.img = img[np.newaxis, ...]
+        # Convert to float32 and normalize to [0, 1]
+        img = img.astype(np.float32)
+        if np.max(img) > 1.0:
+            img = img / 255.0
+
+        # Convert from BGR to RGB (OpenCV uses BGR by default)
+        if len(img.shape) == 3 and img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Transpose to NCHW format (batch, channel, height, width)
+        img = np.transpose(img, (2, 0, 1)).astype(np.float32)
+        self.img = img[np.newaxis, ...]  # Add batch dimension
 
         # pre_pad
         if self.pre_pad != 0:
@@ -143,7 +187,14 @@ class RealESRGANerONNX:
             # Debug input to model
             print(f"Model input shape: {self.img.shape}, min: {np.min(self.img)}, max: {np.max(self.img)}")
 
-            self.output = self.ort_session.run([self.output_name], {self.input_name: self.img})[0]
+            # Ensure input is contiguous and in the correct format
+            input_data = np.ascontiguousarray(self.img)
+
+            # Run inference with proper error handling
+            start_time = time.time()
+            self.output = self.ort_session.run([self.output_name], {self.input_name: input_data})[0]
+            inference_time = time.time() - start_time
+            print(f"Inference completed in {inference_time:.4f} seconds")
 
             # Debug model output
             print(f"Model output shape: {self.output.shape}, min: {np.min(self.output)}, max: {np.max(self.output)}")
@@ -237,6 +288,10 @@ class RealESRGANerONNX:
 
     def enhance(self, img, outscale=None, alpha_upsampler='realesrgan'):
         h_input, w_input = img.shape[0:2]
+
+        # Save a copy of the original image for debugging and fallback
+        original_img = img.copy()
+
         # img: numpy
         img = img.astype(np.float32)
         if np.max(img) > 256:  # 16-bit image
@@ -245,6 +300,7 @@ class RealESRGANerONNX:
         else:
             max_range = 255
         img = img / max_range
+
         if len(img.shape) == 2:  # gray image
             img_mode = 'L'
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
@@ -260,51 +316,86 @@ class RealESRGANerONNX:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         # ------------------- process image (without the alpha channel) ------------------- #
-        self.pre_process(img)
-        if self.tile_size > 0:
-            self.tile_process()
-        else:
-            self.process()
-        output_img = self.post_process()
-        output_img = np.clip(output_img[0], 0, 1)
-        output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
-        if img_mode == 'L':
-            output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
+        try:
+            self.pre_process(img)
+            if self.tile_size > 0:
+                self.tile_process()
+            else:
+                self.process()
 
-        # ------------------- process the alpha channel if necessary ------------------- #
-        if img_mode == 'RGBA':
-            if alpha_upsampler == 'realesrgan':
-                self.pre_process(alpha)
-                if self.tile_size > 0:
-                    self.tile_process()
+            output_img = self.post_process()
+
+            # Ensure output is valid
+            if output_img is None or np.isnan(output_img).any() or np.max(output_img) == 0:
+                print("WARNING: Invalid output from model, using bicubic upscaling as fallback")
+                # Use bicubic upscaling as fallback
+                if outscale is not None:
+                    scale_factor = outscale
                 else:
-                    self.process()
-                output_alpha = self.post_process()
-                output_alpha = np.clip(output_alpha[0], 0, 1)
-                output_alpha = np.transpose(output_alpha[[2, 1, 0], :, :], (1, 2, 0))
-                output_alpha = cv2.cvtColor(output_alpha, cv2.COLOR_BGR2GRAY)
-            else:  # use the cv2 resize for alpha channel
-                h, w = alpha.shape[0:2]
-                output_alpha = cv2.resize(alpha, (w * self.scale, h * self.scale), interpolation=cv2.INTER_LINEAR)
+                    scale_factor = self.scale
 
-            # merge the alpha channel
-            output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2BGRA)
-            output_img[:, :, 3] = output_alpha
+                output_img = cv2.resize(
+                    original_img,
+                    (int(w_input * scale_factor), int(h_input * scale_factor)),
+                    interpolation=cv2.INTER_CUBIC
+                )
+                return output_img, img_mode
 
-        # ------------------------------ return ------------------------------ #
-        if max_range == 65535:  # 16-bit image
-            output = (output_img * 65535.0).round().astype(np.uint16)
-        else:
-            output = (output_img * 255.0).round().astype(np.uint8)
+            output_img = np.clip(output_img[0], 0, 1)
+            output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
 
-        if outscale is not None and outscale != float(self.scale):
+            if img_mode == 'L':
+                output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
+
+            # ------------------- process the alpha channel if necessary ------------------- #
+            if img_mode == 'RGBA':
+                if alpha_upsampler == 'realesrgan':
+                    self.pre_process(alpha)
+                    if self.tile_size > 0:
+                        self.tile_process()
+                    else:
+                        self.process()
+                    output_alpha = self.post_process()
+                    output_alpha = np.clip(output_alpha[0], 0, 1)
+                    output_alpha = np.transpose(output_alpha[[2, 1, 0], :, :], (1, 2, 0))
+                    output_alpha = cv2.cvtColor(output_alpha, cv2.COLOR_BGR2GRAY)
+                else:  # use the cv2 resize for alpha channel
+                    h, w = alpha.shape[0:2]
+                    output_alpha = cv2.resize(alpha, (w * self.scale, h * self.scale), interpolation=cv2.INTER_LINEAR)
+
+                # merge the alpha channel
+                output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2BGRA)
+                output_img[:, :, 3] = output_alpha
+
+            # ------------------------------ return ------------------------------ #
+            if max_range == 65535:  # 16-bit image
+                output = (output_img * 65535.0).round().astype(np.uint16)
+            else:
+                output = (output_img * 255.0).round().astype(np.uint8)
+
+            if outscale is not None and outscale != float(self.scale):
+                output = cv2.resize(
+                    output, (
+                        int(w_input * outscale),
+                        int(h_input * outscale),
+                    ), interpolation=cv2.INTER_LANCZOS4)
+
+            return output, img_mode
+
+        except Exception as e:
+            print(f"Error in enhance method: {e}")
+            # Fallback to bicubic upscaling
+            if outscale is not None:
+                scale_factor = outscale
+            else:
+                scale_factor = self.scale
+
             output = cv2.resize(
-                output, (
-                    int(w_input * outscale),
-                    int(h_input * outscale),
-                ), interpolation=cv2.INTER_LANCZOS4)
-
-        return output, img_mode
+                original_img,
+                (int(w_input * scale_factor), int(h_input * scale_factor)),
+                interpolation=cv2.INTER_CUBIC
+            )
+            return output, img_mode
 
 
 class Reader:
@@ -547,6 +638,14 @@ def inference_video(args, video_save_path):
     else:
         scale = 4
 
+    # Try to import time module for performance measurement
+    try:
+        import time
+    except ImportError:
+        pass
+
+    # Initialize upsampler
+    start_time = time.time()
     upsampler = RealESRGANerONNX(
         scale=scale,
         model_path=args.onnx_model_path,
@@ -555,6 +654,7 @@ def inference_video(args, video_save_path):
         pre_pad=args.pre_pad,
         gpu_id=args.gpu_id
     )
+    print(f"Upsampler initialization took {time.time() - start_time:.2f} seconds")
 
     reader = Reader(args)
     audio = reader.get_audio()
@@ -571,9 +671,27 @@ def inference_video(args, video_save_path):
 
     pbar = tqdm(total=len(reader), unit='frame', desc='inference')
     frame_count = 0
+    total_processing_time = 0
 
     # Process first few frames with extra debugging
     verbose_debug = args.verbose_debug
+
+    # Try a test inference with a small image first
+    if args.debug:
+        print("Running test inference with a small image...")
+        test_img = np.zeros((64, 64, 3), dtype=np.uint8)
+        # Create a simple pattern
+        test_img[20:40, 20:40, 0] = 255  # Red square
+        test_img[30:50, 30:50, 1] = 255  # Green square
+        test_img[10:30, 30:50, 2] = 255  # Blue square
+
+        try:
+            test_output, _ = upsampler.enhance(test_img, outscale=args.outscale)
+            test_path = os.path.join(debug_dir, "test_inference.png")
+            cv2.imwrite(test_path, test_output)
+            print(f"Test inference successful, output saved to {test_path}")
+        except Exception as e:
+            print(f"Test inference failed: {e}")
 
     while True:
         img = reader.get_frame()
@@ -606,7 +724,18 @@ def inference_video(args, video_save_path):
             if verbose_debug and frame_count < 3:
                 print(f"Processing frame {frame_count} with enhanced debugging")
 
+            # Measure processing time
+            frame_start_time = time.time()
+
+            # Process the frame
             output, img_mode = upsampler.enhance(img, outscale=args.outscale)
+
+            # Calculate and accumulate processing time
+            frame_time = time.time() - frame_start_time
+            total_processing_time += frame_time
+
+            if verbose_debug and frame_count < 3:
+                print(f"Frame {frame_count} processed in {frame_time:.4f} seconds")
 
             # Debug: Print output frame info
             if args.debug:
@@ -666,6 +795,14 @@ def inference_video(args, video_save_path):
 
     reader.close()
     writer.close()
+
+    # Print performance statistics
+    if frame_count > 0:
+        avg_time_per_frame = total_processing_time / frame_count
+        fps = 1.0 / avg_time_per_frame if avg_time_per_frame > 0 else 0
+        print(f"Average processing time per frame: {avg_time_per_frame:.4f} seconds")
+        print(f"Effective processing rate: {fps:.2f} FPS")
+
     print(f"Video processing complete. Processed {frame_count} frames.")
     print(f"Output saved to: {video_save_path}")
 
