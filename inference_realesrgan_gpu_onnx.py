@@ -76,24 +76,40 @@ class RealESRGANerONNX:
         print(f"Using providers: {providers}")
 
         # Load ONNX model
-        self.ort_session = ort.InferenceSession(model_path, providers=providers)
-        self.input_name = self.ort_session.get_inputs()[0].name
-        self.output_name = self.ort_session.get_outputs()[0].name
+        try:
+            self.ort_session = ort.InferenceSession(model_path, providers=providers)
+            self.input_name = self.ort_session.get_inputs()[0].name
+            self.output_name = self.ort_session.get_outputs()[0].name
 
-        # Check if GPU is being used
-        session_providers = self.ort_session.get_providers()
-        print(f"Active providers: {session_providers}")
-        if 'CUDAExecutionProvider' in session_providers:
-            print(f"Using GPU acceleration with CUDA (device ID: {gpu_id})")
-        else:
-            print("WARNING: CUDA is not available. Falling back to CPU execution.")
-            if cuda_available:
-                print("CUDA provider was available but not used. This might be due to CUDA compatibility issues.")
-                print("Try installing the correct CUDA version for your GPU.")
+            # Check if GPU is being used
+            session_providers = self.ort_session.get_providers()
+            print(f"Active providers: {session_providers}")
+            if 'CUDAExecutionProvider' in session_providers:
+                print(f"Using GPU acceleration with CUDA (device ID: {gpu_id})")
+            else:
+                print("WARNING: CUDA is not available. Falling back to CPU execution.")
+                if cuda_available:
+                    print("CUDA provider was available but not used. This might be due to CUDA compatibility issues.")
+                    print("Try installing the correct CUDA version for your GPU.")
+        except Exception as e:
+            print(f"Error initializing ONNX session: {e}")
+            print("Trying to load with CPU provider only...")
+            self.ort_session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+            self.input_name = self.ort_session.get_inputs()[0].name
+            self.output_name = self.ort_session.get_outputs()[0].name
+            print("Successfully loaded model with CPU provider.")
 
     def pre_process(self, img):
         """Pre-process, such as pre-pad and mod pad, so that the images can be divisible
         """
+        # Debug input image
+        print(f"Pre-process input shape: {img.shape}, dtype: {img.dtype}, min: {np.min(img)}, max: {np.max(img)}")
+
+        # Check for NaN or invalid values
+        if np.isnan(img).any():
+            print("WARNING: Input image contains NaN values!")
+            img = np.nan_to_num(img)
+
         img = np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0
         self.img = img[np.newaxis, ...]
 
@@ -106,6 +122,9 @@ class RealESRGANerONNX:
             self.mod_scale = 2
         elif self.scale == 1:
             self.mod_scale = 4
+        else:
+            self.mod_scale = self.scale  # Default to scale value
+
         if self.mod_scale is not None:
             self.mod_pad_h, self.mod_pad_w = 0, 0
             _, _, h, w = self.img.shape
@@ -115,9 +134,33 @@ class RealESRGANerONNX:
                 self.mod_pad_w = (self.mod_scale - w % self.mod_scale)
             self.img = np.pad(self.img, ((0, 0), (0, 0), (0, self.mod_pad_h), (0, self.mod_pad_w)), mode='reflect')
 
+        # Debug processed input
+        print(f"Processed input shape: {self.img.shape}, min: {np.min(self.img)}, max: {np.max(self.img)}")
+
     def process(self):
         # model inference
-        self.output = self.ort_session.run([self.output_name], {self.input_name: self.img})[0]
+        try:
+            # Debug input to model
+            print(f"Model input shape: {self.img.shape}, min: {np.min(self.img)}, max: {np.max(self.img)}")
+
+            self.output = self.ort_session.run([self.output_name], {self.input_name: self.img})[0]
+
+            # Debug model output
+            print(f"Model output shape: {self.output.shape}, min: {np.min(self.output)}, max: {np.max(self.output)}")
+
+            # Check for NaN or zero values in output
+            if np.isnan(self.output).any():
+                print("WARNING: Model output contains NaN values!")
+                self.output = np.nan_to_num(self.output)
+
+            if np.max(self.output) == 0:
+                print("WARNING: Model output is all zeros!")
+        except Exception as e:
+            print(f"Error during model inference: {e}")
+            # Create a dummy output as fallback
+            _, _, h, w = self.img.shape
+            self.output = np.zeros((1, 3, h * self.scale, w * self.scale), dtype=np.float32)
+            print("Created fallback output due to inference error.")
 
     def tile_process(self):
         """It will first crop input images to tiles, and then process each tile.
@@ -528,10 +571,18 @@ def inference_video(args, video_save_path):
 
     pbar = tqdm(total=len(reader), unit='frame', desc='inference')
     frame_count = 0
+
+    # Process first few frames with extra debugging
+    verbose_debug = args.verbose_debug
+
     while True:
         img = reader.get_frame()
         if img is None:
             break
+
+        # Extra debugging for first few frames
+        if verbose_debug and frame_count < 3:
+            print(f"\n==== DETAILED DEBUG FOR FRAME {frame_count} ====")
 
         # Debug: Print input frame info
         if args.debug and frame_count == 0:
@@ -540,16 +591,48 @@ def inference_video(args, video_save_path):
             cv2.imwrite(input_debug_path, img)
             print(f"Saved input debug frame to: {input_debug_path}")
 
+            # Save a simple color test pattern to verify file writing works
+            test_pattern = np.zeros((height, width, 3), dtype=np.uint8)
+            # Red, Green, Blue squares
+            h_third, w_third = height // 3, width // 3
+            test_pattern[0:h_third, 0:w_third, 2] = 255  # Red
+            test_pattern[h_third:2*h_third, w_third:2*w_third, 1] = 255  # Green
+            test_pattern[2*h_third:, 2*w_third:, 0] = 255  # Blue
+            test_pattern_path = os.path.join(debug_dir, "test_pattern.png")
+            cv2.imwrite(test_pattern_path, test_pattern)
+            print(f"Saved test pattern to: {test_pattern_path}")
+
         try:
+            if verbose_debug and frame_count < 3:
+                print(f"Processing frame {frame_count} with enhanced debugging")
+
             output, img_mode = upsampler.enhance(img, outscale=args.outscale)
 
             # Debug: Print output frame info
             if args.debug:
                 print(f"Output frame shape: {output.shape}, dtype: {output.dtype}, min: {np.min(output)}, max: {np.max(output)}")
-                if frame_count % 10 == 0:  # Save every 10th frame to avoid too many files
+
+                # Save output frame
+                if frame_count % 10 == 0 or (verbose_debug and frame_count < 3):
                     output_debug_path = os.path.join(debug_dir, f"output_frame_{frame_count}.png")
-                    cv2.imwrite(output_debug_path, output)
+                    # Make a copy to avoid modifying the original
+                    output_copy = output.copy()
+
+                    # If output is all black, add a visible marker
+                    if np.max(output_copy) == 0:
+                        h, w = output_copy.shape[:2]
+                        cv2.putText(output_copy, "BLACK FRAME", (w//4, h//2),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+                    cv2.imwrite(output_debug_path, output_copy)
                     print(f"Saved output debug frame to: {output_debug_path}")
+
+                    # Also save a resized version of the original for comparison
+                    resized_img = cv2.resize(img, (output.shape[1], output.shape[0]),
+                                           interpolation=cv2.INTER_LANCZOS4)
+                    resized_path = os.path.join(debug_dir, f"resized_original_{frame_count}.png")
+                    cv2.imwrite(resized_path, resized_img)
+                    print(f"Saved resized original to: {resized_path}")
 
             # Ensure output is valid
             if np.isnan(output).any() or np.max(output) == 0:
@@ -562,6 +645,10 @@ def inference_video(args, video_save_path):
         except RuntimeError as error:
             print(f'Error processing frame {frame_count}:', error)
             print('If you encounter memory issues, try to set --tile with a smaller number.')
+            # Resize original frame as fallback
+            output = cv2.resize(img, (int(width * args.outscale), int(height * args.outscale)),
+                               interpolation=cv2.INTER_LANCZOS4)
+            writer.write_frame(output)
         except Exception as e:
             print(f'Unexpected error processing frame {frame_count}:', e)
             # Resize original frame as fallback
@@ -571,6 +658,11 @@ def inference_video(args, video_save_path):
 
         pbar.update(1)
         frame_count += 1
+
+        # End verbose debugging after a few frames
+        if verbose_debug and frame_count >= 3:
+            verbose_debug = False
+            print("Ending verbose debugging after 3 frames")
 
     reader.close()
     writer.close()
@@ -606,6 +698,7 @@ def main():
     parser.add_argument('--ffmpeg_bin', type=str, default='ffmpeg', help='The path to ffmpeg')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU device ID to use')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode to save intermediate frames')
+    parser.add_argument('--verbose_debug', action='store_true', help='Enable verbose debugging for the first few frames')
     args = parser.parse_args()
 
     # Set default ONNX model path if not provided
