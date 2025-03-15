@@ -61,11 +61,19 @@ class RealESRGANerONNX:
         self.mod_scale = None
         self.gpu_id = gpu_id
 
-        # Check if CUDA is available
+        # Setup providers for ONNX Runtime
+        # Always try to use CUDA first, then fall back to CPU if not available
         providers = []
-        if ort.get_device() == 'GPU':
+
+        # Check if CUDA is available in ONNX Runtime
+        cuda_available = 'CUDAExecutionProvider' in ort.get_available_providers()
+        if cuda_available:
             providers.append(('CUDAExecutionProvider', {'device_id': self.gpu_id}))
         providers.append('CPUExecutionProvider')
+
+        # Print available providers for debugging
+        print(f"Available ONNX Runtime providers: {ort.get_available_providers()}")
+        print(f"Using providers: {providers}")
 
         # Load ONNX model
         self.ort_session = ort.InferenceSession(model_path, providers=providers)
@@ -74,10 +82,14 @@ class RealESRGANerONNX:
 
         # Check if GPU is being used
         session_providers = self.ort_session.get_providers()
+        print(f"Active providers: {session_providers}")
         if 'CUDAExecutionProvider' in session_providers:
             print(f"Using GPU acceleration with CUDA (device ID: {gpu_id})")
         else:
             print("WARNING: CUDA is not available. Falling back to CPU execution.")
+            if cuda_available:
+                print("CUDA provider was available but not used. This might be due to CUDA compatibility issues.")
+                print("Try installing the correct CUDA version for your GPU.")
 
     def pre_process(self, img):
         """Pre-process, such as pre-pad and mod pad, so that the images can be divisible
@@ -338,6 +350,8 @@ class Writer:
             print('You are generating video that is larger than 4K, which will be very slow due to IO speed.',
                   'We highly recommend to decrease the outscale(aka, -s).')
 
+        print(f"Creating output video with dimensions: {out_width}x{out_height}, FPS: {fps}")
+
         if audio is not None:
             self.stream_writer = (
                 ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{out_width}x{out_height}',
@@ -358,12 +372,33 @@ class Writer:
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
 
     def write_frame(self, frame):
-        frame = frame.astype(np.uint8).tobytes()
-        self.stream_writer.stdin.write(frame)
+        # Ensure frame is valid
+        if frame is None or frame.size == 0:
+            print("Warning: Empty frame detected, skipping")
+            return
+
+        # Ensure frame is in the correct format (uint8)
+        if frame.dtype != np.uint8:
+            print(f"Warning: Converting frame from {frame.dtype} to uint8")
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+        # Check if frame has any content
+        if np.max(frame) == 0:
+            print("Warning: Black frame detected")
+
+        try:
+            frame_bytes = frame.tobytes()
+            self.stream_writer.stdin.write(frame_bytes)
+        except Exception as e:
+            print(f"Error writing frame: {e}")
 
     def close(self):
-        self.stream_writer.stdin.close()
-        self.stream_writer.wait()
+        try:
+            self.stream_writer.stdin.close()
+            self.stream_writer.wait()
+            print("Video writer closed successfully")
+        except Exception as e:
+            print(f"Error closing video writer: {e}")
 
 
 def convert_to_onnx(model_name, model_path, onnx_path):
@@ -484,24 +519,63 @@ def inference_video(args, video_save_path):
     fps = reader.get_fps()
     writer = Writer(args, audio, height, width, video_save_path, fps)
 
+    # Create debug directory if needed
+    debug_dir = None
+    if args.debug:
+        debug_dir = os.path.join(args.output, 'debug_frames')
+        os.makedirs(debug_dir, exist_ok=True)
+        print(f"Debug frames will be saved to: {debug_dir}")
+
     pbar = tqdm(total=len(reader), unit='frame', desc='inference')
+    frame_count = 0
     while True:
         img = reader.get_frame()
         if img is None:
             break
 
+        # Debug: Print input frame info
+        if args.debug and frame_count == 0:
+            print(f"Input frame shape: {img.shape}, dtype: {img.dtype}, min: {np.min(img)}, max: {np.max(img)}")
+            input_debug_path = os.path.join(debug_dir, f"input_frame_{frame_count}.png")
+            cv2.imwrite(input_debug_path, img)
+            print(f"Saved input debug frame to: {input_debug_path}")
+
         try:
-            output, _ = upsampler.enhance(img, outscale=args.outscale)
+            output, img_mode = upsampler.enhance(img, outscale=args.outscale)
+
+            # Debug: Print output frame info
+            if args.debug:
+                print(f"Output frame shape: {output.shape}, dtype: {output.dtype}, min: {np.min(output)}, max: {np.max(output)}")
+                if frame_count % 10 == 0:  # Save every 10th frame to avoid too many files
+                    output_debug_path = os.path.join(debug_dir, f"output_frame_{frame_count}.png")
+                    cv2.imwrite(output_debug_path, output)
+                    print(f"Saved output debug frame to: {output_debug_path}")
+
+            # Ensure output is valid
+            if np.isnan(output).any() or np.max(output) == 0:
+                print(f"Warning: Frame {frame_count} has invalid values. Using original frame instead.")
+                # Resize original frame as fallback
+                output = cv2.resize(img, (int(width * args.outscale), int(height * args.outscale)),
+                                   interpolation=cv2.INTER_LANCZOS4)
+
+            writer.write_frame(output)
         except RuntimeError as error:
-            print('Error', error)
+            print(f'Error processing frame {frame_count}:', error)
             print('If you encounter memory issues, try to set --tile with a smaller number.')
-        else:
+        except Exception as e:
+            print(f'Unexpected error processing frame {frame_count}:', e)
+            # Resize original frame as fallback
+            output = cv2.resize(img, (int(width * args.outscale), int(height * args.outscale)),
+                               interpolation=cv2.INTER_LANCZOS4)
             writer.write_frame(output)
 
         pbar.update(1)
+        frame_count += 1
 
     reader.close()
     writer.close()
+    print(f"Video processing complete. Processed {frame_count} frames.")
+    print(f"Output saved to: {video_save_path}")
 
 
 def main():
@@ -531,6 +605,7 @@ def main():
     parser.add_argument('--fps', type=float, default=None, help='FPS of the output video')
     parser.add_argument('--ffmpeg_bin', type=str, default='ffmpeg', help='The path to ffmpeg')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU device ID to use')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode to save intermediate frames')
     args = parser.parse_args()
 
     # Set default ONNX model path if not provided
